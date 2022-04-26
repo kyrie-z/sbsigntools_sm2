@@ -106,6 +106,7 @@ struct cert_table_header {
 struct image *image_load(const char *filename);
 
 int image_hash_sha256(struct image *image, uint8_t digest[]);
+int image_hash_sm3(struct image *image, uint8_t digest[]);
 int image_add_signature(struct image *, void *sig, int size);
 int image_get_signature(struct image *image, int signum,
 			uint8_t **buf, size_t *size);

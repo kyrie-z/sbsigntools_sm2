@@ -36,6 +36,7 @@
 #include <openssl/err.h>
 #include <openssl/pkcs7.h>
 #include <openssl/x509.h>
+#include <openssl/ec.h>
 
 #include <ccan/talloc/talloc.h>
 
@@ -121,6 +122,8 @@ ASN1_SEQUENCE(IDC) = {
 
 IMPLEMENT_ASN1_FUNCTIONS(IDC)
 
+#define DEFAULT_DIGEST_LENGTH 32
+
 static int type_set_sequence(void *ctx, ASN1_TYPE *type,
 		void *s, const ASN1_ITEM *it)
 {
@@ -146,20 +149,179 @@ const char obsolete[] = {
 	0x00, 0x65, 0x00, 0x3e, 0x00, 0x3e, 0x00, 0x3e
 };
 
-const char *sha256_str(const uint8_t *hash)
+
+static int PKCS7_type_is_other(PKCS7 *p7)
 {
-	static char s[SHA256_DIGEST_LENGTH * 2 + 1];
+	int isOther = 1;
+
+	int nid = OBJ_obj2nid(p7->type);
+
+	switch (nid) {
+	case NID_pkcs7_data:
+	case NID_pkcs7_signed:
+	case NID_pkcs7_enveloped:
+	case NID_pkcs7_signedAndEnveloped:
+	case NID_pkcs7_digest:
+	case NID_pkcs7_encrypted:
+		isOther = 0;
+		break;
+	default:
+		isOther = 1;
+	}
+
+	return isOther;
+};
+
+static ASN1_OCTET_STRING *PKCS7_get_octet_string(PKCS7 *p7)
+{
+	if (PKCS7_type_is_data(p7))
+		return p7->d.data;
+	if (PKCS7_type_is_other(p7) && p7->d.other && (p7->d.other->type == V_ASN1_OCTET_STRING))
+		return p7->d.other->value.octet_string;
+	return NULL;
+};
+
+const char *hash_str(const uint8_t *hash)
+{
+	static char s[DEFAULT_DIGEST_LENGTH * 2 + 1];
 	int i;
 
-	for (i = 0; i < SHA256_DIGEST_LENGTH; i++)
+	for (i = 0; i < DEFAULT_DIGEST_LENGTH; i++)
 		snprintf(s + i * 2, 3, "%02x", hash[i]);
 
 	return s;
 }
 
+static unsigned char* sha256_data(char* data, int data_size)
+{
+	unsigned char digest[SHA256_DIGEST_LENGTH] = {};
+
+	SHA256_CTX sc;
+	SHA256_Init(&sc);
+	SHA256_Update(&sc, data, data_size);
+	SHA256_Final(digest, &sc);
+
+	char *ret = calloc(SHA256_DIGEST_LENGTH, sizeof(char));
+	memcpy(ret, digest, SHA256_DIGEST_LENGTH);
+	return ret;
+}
+
+static unsigned char* sm3_data(char* data, int data_size)
+{
+	unsigned char digest[32] = {};
+
+	EVP_MD_CTX *md_ctx;
+	const EVP_MD *md;
+	md = EVP_sm3();
+	md_ctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(md_ctx,md,NULL);
+	EVP_DigestUpdate(md_ctx,data,data_size);
+	EVP_DigestFinal_ex(md_ctx,digest,NULL);
+
+	char *ret = calloc(32, sizeof(char));
+	memcpy(ret, digest, 32);
+	return ret;
+}
+
+int rsa_sign_it(const unsigned char *msg,int msg_len, EVP_PKEY *pkey,
+                       unsigned char **sig_data, int *slen) {
+
+	EVP_MD_CTX *mdctx = NULL;
+	*sig_data = NULL;
+	*slen = 0;
+
+	if (!(mdctx = EVP_MD_CTX_create()))
+		goto err;
+
+	if (!EVP_DigestSignInit(mdctx, NULL, EVP_sha256(), NULL, pkey))
+		goto err;
+
+	if (!EVP_DigestSignUpdate(mdctx, msg, msg_len))
+		goto err;
+
+	if (!EVP_DigestSignFinal(mdctx, NULL, slen))
+		goto err;
+
+	unsigned char *tmp;
+	if (!(tmp = OPENSSL_malloc(sizeof(unsigned char) * (*slen)))) {
+		printf("malloc failed\n");
+		goto err;
+	}
+
+	if (!EVP_DigestSignFinal(mdctx, tmp, slen))
+		goto err;
+
+	*sig_data = tmp;
+	EVP_MD_CTX_free(mdctx);
+	return 1;
+err:
+	if (mdctx !=NULL)
+		EVP_MD_CTX_free(mdctx);
+	if (tmp !=NULL)
+		free(tmp);
+	return -1;
+}
+
+int sm2_sign_it(const unsigned char *msg,int msg_len, EVP_PKEY *pkey,
+                       unsigned char **sig_data, int *slen) {
+
+	*sig_data = NULL;
+	*slen = 0;
+
+	if (!EVP_PKEY_set_alias_type(pkey, EVP_PKEY_SM2))
+	{
+		printf("EVP_PKEY_set_alias_type() fail!!\n");
+		goto err;
+	}
+
+	EVP_MD_CTX *md_sign_ctx = EVP_MD_CTX_new();
+	if (md_sign_ctx ==NULL){
+		printf("md_sign_ctx fail!!\n");
+		goto err;
+	}
+	EVP_MD_CTX_init(md_sign_ctx);
+	if(!EVP_SignInit_ex(md_sign_ctx, EVP_sm3(),NULL))
+	{
+		printf("EVP_SignInit_ex() fail!!\n");
+		goto err;
+	}
+
+	if(!EVP_SignUpdate(md_sign_ctx,msg,msg_len))
+	{
+		printf("EVP_SignUpdate() fail!!\n");
+		goto err;
+	}
+	if(!EVP_SignFinal(md_sign_ctx,NULL,slen,pkey)){
+		printf("EVP_SignFinal() fail!!\n");
+		goto err;
+	}
+
+	unsigned char *sig_tmp = NULL;
+	if (!(sig_tmp = (unsigned char *)malloc(*slen)))
+	{
+		goto err;
+	}
+
+	if(!EVP_SignFinal(md_sign_ctx,sig_tmp,slen,pkey)){
+		printf("EVP_SignFinal() fail!!\n");
+		goto err;
+	}
+	*sig_data = sig_tmp;
+
+	EVP_MD_CTX_free(md_sign_ctx);
+	return 1;
+err:
+	if (md_sign_ctx !=NULL)
+		EVP_PKEY_CTX_free(md_sign_ctx);
+	if (sig_tmp !=NULL)
+		free(sig_tmp);
+
+	return -1;
+}
+
 int IDC_set(PKCS7 *p7, PKCS7_SIGNER_INFO *si, struct image *image)
 {
-	uint8_t *buf, *tmp, sha[SHA256_DIGEST_LENGTH];
+	uint8_t *buf, *tmp, sha[DEFAULT_DIGEST_LENGTH];
 	int idc_nid, peid_nid, len, rc;
 	IDC_PEID *peid;
 	ASN1_STRING *s;
@@ -174,7 +336,16 @@ int IDC_set(PKCS7 *p7, PKCS7_SIGNER_INFO *si, struct image *image)
 			"spcPEImageData",
 			"PE Image Data");
 
-	image_hash_sha256(image, sha);
+	if (OBJ_obj2nid(si->digest_alg->algorithm)==NID_sha256){
+		image_hash_sha256(image, sha);
+	}
+	else if (OBJ_obj2nid(si->digest_alg->algorithm) == NID_sm3){
+		image_hash_sm3(image, sha);
+	}
+	else{
+		fprintf(stderr, "Invalid signature algorithm type\n");
+		return -1;
+	}
 
 	idc = IDC_new();
 	peid = IDC_PEID_new();
@@ -192,7 +363,7 @@ int IDC_set(PKCS7 *p7, PKCS7_SIGNER_INFO *si, struct image *image)
 	type_set_sequence(image, idc->data->value, peid, &IDC_PEID_it);
 
         idc->digest->alg->parameter = ASN1_TYPE_new();
-        idc->digest->alg->algorithm = OBJ_nid2obj(NID_sha256);
+        idc->digest->alg->algorithm =  si->digest_alg->algorithm;
         idc->digest->alg->parameter->type = V_ASN1_NULL;
         ASN1_OCTET_STRING_set(idc->digest->digest, sha, sizeof(sha));
 
@@ -208,16 +379,54 @@ int IDC_set(PKCS7 *p7, PKCS7_SIGNER_INFO *si, struct image *image)
 	 * data types, we create a temporary BIO to hold the signed data, so
 	 * that the top-level PKCS7 object calculates the correct hash...
 	 */
-	sigbio = PKCS7_dataInit(p7, NULL);
-	BIO_write(sigbio, buf+2, len-2);
+	// sigbio = PKCS7_dataInit(p7, NULL);
+	// BIO_write(sigbio, buf+2, len-2);
 
-	/* ... then we finalise the p7 content, which does the actual
-	 * signing ... */
-	rc = PKCS7_dataFinal(p7, sigbio);
-	if (!rc) {
-		fprintf(stderr, "dataFinal failed\n");
-		ERR_print_errors_fp(stderr);
+	// /* ... then we finalise the p7 content, which does the actual
+	//  * signing ... */
+	// rc = PKCS7_dataFinal(p7, sigbio);
+	// if (!rc) {
+	// 	fprintf(stderr, "dataFinal failed\n");
+	// 	ERR_print_errors_fp(stderr);
+	// 	return -1;
+	// }
+
+	/* pkey_sm2_ctrl不支持EVP_PKEY_CTRL_PKCS7_SIGN类型，无法通过
+	 EVP_PKEY_CTX_ctrl调用，不能使用PKCS7_dataFinal来gm签名*/
+
+	if (!PKCS7_get_signed_attribute(si,NID_pkcs9_signingTime)){
+		PKCS7_add0_attrib_signing_time(si, NULL);
+	}
+
+	unsigned char *msg_digest = NULL;
+	if (OBJ_obj2nid(si->digest_alg->algorithm)==NID_sha256){
+		msg_digest = sha256_data((char *)(buf + 2), len - 2);
+	}
+	else if (OBJ_obj2nid(si->digest_alg->algorithm)==NID_sm3){
+		msg_digest = sm3_data((char *)(buf + 2), len - 2);
+	}
+	PKCS7_add1_attrib_digest(si,msg_digest,DEFAULT_DIGEST_LENGTH);
+	free(msg_digest);
+
+	unsigned char *aattr_buf = NULL;
+	int aattr_buflen = ASN1_item_i2d((ASN1_VALUE *)(si->auth_attr), &aattr_buf, ASN1_ITEM_rptr(PKCS7_ATTR_SIGN));
+
+	unsigned char *enc_digest = NULL;
+	int enc_len;
+	if (OBJ_obj2nid(si->digest_alg->algorithm)==NID_sha256 && si->pkey != NULL){
+		rc=rsa_sign_it(aattr_buf,aattr_buflen, si->pkey, &enc_digest, &enc_len);
+	}else if (OBJ_obj2nid(si->digest_alg->algorithm)==NID_sm3 && si->pkey != NULL){
+		rc=sm2_sign_it(aattr_buf,aattr_buflen, si->pkey, &enc_digest, &enc_len);
+	}
+	if (rc <= 0){
+		printf("sign fail!!\n");
 		return -1;
+	}
+	ASN1_STRING_set0(si->enc_digest,enc_digest,enc_len);
+
+	ASN1_OCTET_STRING *sign_contents = PKCS7_get_octet_string(p7->d.sign->contents);
+	if (!PKCS7_is_detached(p7) && !(sign_contents->flags & ASN1_STRING_FLAG_NDEF)){
+		ASN1_STRING_set0(sign_contents, (buf+2), len-2);
 	}
 
 	/* ... and we replace the content with the actual IDC ASN type. */
@@ -274,14 +483,19 @@ struct idc *IDC_get(PKCS7 *p7, BIO *bio)
 
 int IDC_check_hash(struct idc *idc, struct image *image)
 {
-	unsigned char sha[SHA256_DIGEST_LENGTH];
+	unsigned char sha[DEFAULT_DIGEST_LENGTH];
 	const unsigned char *buf;
 	ASN1_STRING *str;
 
 	image_hash_sha256(image, sha);
 
 	/* check hash algorithm sanity */
-	if (OBJ_cmp(idc->digest->alg->algorithm, OBJ_nid2obj(NID_sha256))) {
+	int alg_nid = OBJ_obj2nid(idc->digest->alg->algorithm);
+	if (alg_nid == NID_sm3){
+		image_hash_sm3(image, sha);
+	}else if (alg_nid == NID_sha256){
+		image_hash_sha256(image, sha);
+	}else{
 		fprintf(stderr, "Invalid algorithm type\n");
 		return -1;
 	}
@@ -300,8 +514,8 @@ int IDC_check_hash(struct idc *idc, struct image *image)
 #endif
 	if (memcmp(buf, sha, sizeof(sha))) {
 		fprintf(stderr, "Hash doesn't match image\n");
-		fprintf(stderr, " got:       %s\n", sha256_str(buf));
-		fprintf(stderr, " expecting: %s\n", sha256_str(sha));
+		fprintf(stderr, " got:       %s\n", hash_str(buf));
+		fprintf(stderr, " expecting: %s\n", hash_str(sha));
 		return -1;
 	}
 

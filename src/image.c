@@ -539,6 +539,37 @@ int image_hash_sha256(struct image *image, uint8_t digest[])
 	return !rc;
 }
 
+int image_hash_sm3(struct image *image, uint8_t digest[])
+{
+	struct region *region;
+	int rc, i, n;
+
+	EVP_MD *md = EVP_sm3();
+	EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+	EVP_DigestInit_ex(md_ctx, md, NULL);
+
+	n = 0;
+	for (i = 0; i < image->n_checksum_regions; i++) {
+		region = &image->checksum_regions[i];
+		n += region->size;
+#if 0
+		printf("sum region: 0x%04lx -> 0x%04lx [0x%04x bytes]\n",
+				region->data - image->buf,
+				region->data - image->buf - 1 + region->size,
+				region->size);
+
+#endif
+		rc = EVP_DigestUpdate(md_ctx, region->data, region->size);
+		if (!rc)
+			return -1;
+	}
+
+	rc = EVP_DigestFinal_ex(md_ctx,digest,NULL);
+	EVP_MD_CTX_free(md_ctx);
+
+	return !rc;
+}
+
 int image_add_signature(struct image *image, void *sig, int size)
 {
 	struct cert_table_header *cth;

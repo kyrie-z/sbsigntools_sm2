@@ -255,7 +255,19 @@ int main(int argc, char **argv)
 	if (!cert)
 		return EXIT_FAILURE;
 
-	const EVP_MD *md = EVP_get_digestbyname("SHA256");
+	const EVP_MD *md;
+	X509_ALGOR *sig_alg = X509_get0_tbs_sigalg(cert);
+	int alg_nid = OBJ_obj2nid(sig_alg->algorithm);
+	if (alg_nid == NID_sha256WithRSAEncryption){
+		md = EVP_get_digestbyname("SHA256");
+	}
+	else if (alg_nid == NID_sm3WithSM2Sign){
+		md = EVP_get_digestbyname("sm3");
+	}
+	else{
+		fprintf(stderr, "Invalid cert signature algorithm type\n");
+		return EXIT_FAILURE;
+	}
 
 	/* set up the PKCS7 object */
 	PKCS7 *p7 = PKCS7_new();
